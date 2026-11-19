@@ -1,0 +1,71 @@
+name: CarPlay Native PCM Prototype
+on:
+  push:
+    paths:
+      - 'experiments/carplay_alsa/**'
+      - 'native/equalizer-dsp/snapshot.js'
+      - 'tests/equalizer_snapshot.test.js'
+      - '.github/workflows/carplay_pcm_prototype.yml'
+  pull_request:
+    paths:
+      - 'experiments/carplay_alsa/**'
+      - 'native/equalizer-dsp/snapshot.js'
+      - 'tests/equalizer_snapshot.test.js'
+      - '.github/workflows/carplay_pcm_prototype.yml'
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile fake ALSA and isolated filter
+        run: |
+          cd experiments/carplay_alsa
+          mkdir -p build
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -o build/libfakealsa_live.so fake_alsa_live.c -lm
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -o build/libmgu_cp_live.so carplay_live_filter.c eq_dsp.c eq_snapshot.c -ldl -lm -pthread
+          cc -std=c11 -O2 -Wall -Wextra -Werror -o build/test_cp_live test_carplay_live.c \
+            -Lbuild -lfakealsa_live -lmgu_cp_live -lm -pthread -Wl,-rpath,'$ORIGIN'
+          cc -std=c11 -O2 -Wall -Wextra -Werror -o build/test_cp_bridge test_carplay_bridge.c \
+            -Lbuild -lfakealsa_live -lmgu_cp_live -lm -pthread -Wl,-rpath,'$ORIGIN'
+          cc -std=c11 -O2 -Wall -Wextra -Werror -o build/test_eq_snapshot test_eq_snapshot.c eq_snapshot.c eq_dsp.c -lm
+      - name: Simulated CarPlay PCM writes
+        run: |
+          cd experiments/carplay_alsa
+          LD_PRELOAD=./build/libmgu_cp_live.so ./build/test_cp_live
+      - name: Snapshot format shared with the Node DSP service
+        run: |
+          mkdir -p experiments/carplay_alsa/build/fixtures
+          node tests/equalizer_snapshot.test.js --fixture experiments/carplay_alsa/build/fixtures
+          experiments/carplay_alsa/build/test_eq_snapshot experiments/carplay_alsa/build/fixtures
+      - name: Snapshot bridge with fake ALSA
+        run: |
+          cd experiments/carplay_alsa
+          LD_PRELOAD=./build/libmgu_cp_live.so ./build/test_cp_bridge "$RUNNER_TEMP"
+      - name: Enforce default bypass and vehicle isolation
+        run: |
+          ! grep -q 'libmgu_cp_live.so' native/equalizer-dsp/component.json
+          ! grep -q 'libmgu_cp_live' native/equalizer-dsp/server.js
+          ! grep -q 'LD_PRELOAD' apps/equalizer/main.js
+          ! grep -rq 'MGU_CP_LIVE_SNAPSHOT' native apps
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow TSan memory layout on current runner kernels
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Bridge stress under ThreadSanitizer
+        run: |
+          cd experiments/carplay_alsa
+          mkdir -p tsan
+          F="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=thread"
+          cc $F -fPIC -shared -o tsan/libfakealsa_live.so fake_alsa_live.c -lm
+          cc $F -fPIC -shared -o tsan/libmgu_cp_live.so carplay_live_filter.c eq_dsp.c eq_snapshot.c -ldl -lm -pthread
+          # Link order puts the interposer first, so RTLD_NEXT resolves to fake ALSA without LD_PRELOAD.
+          cc $F -o tsan/test_cp_bridge test_carplay_bridge.c -Ltsan -Wl,--no-as-needed -lmgu_cp_live -lfakealsa_live \
+            -lm -pthread -Wl,-rpath,'$ORIGIN'
+          TSAN_OPTIONS=halt_on_error=1 ./tsan/test_cp_bridge "$RUNNER_TEMP" 5000
